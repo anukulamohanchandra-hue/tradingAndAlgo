@@ -1,0 +1,83 @@
+Good — both of these will materially help you understand whether the strategy is actually working before risking real money. Let me explain what I'm building and one important design point about (c) first.
+
+## Design Point: Paper-Trading vs Dry-Run
+
+These are different things and I want to be precise:
+
+| Mode | Orders sent? | Fills tracked? | P&L tracked? |
+|---|---|---|---|
+| **Live** | Real, to Kite | Yes (real) | Yes (real) |
+| **Dry-run** | None — signal logged, not fired | No | No (just signals logged) |
+| **Paper-trade** | None — but simulated fill at market price | Yes (simulated) | Yes (simulated, with slippage) |
+
+Dry-run answers *"would the agent have wanted to trade?"* Paper-trade answers *"if it had traded, would it have made money?"* You need both. Paper-trade is what you should run for ~5 sessions before going live — it tracks the full lifecycle (entry, SL/TP/timer exits, P&L) using live market data but no real orders.
+
+For (b), attribution analysis, I'm building it to answer specific questions: *which signal type makes money? which underlying? which time of day? does the Greeks filter help or hurt?* Without this, you'll just see one aggregate P&L number and have no idea what to fix when things go wrong.## What's Now Built
+
+**Paper broker (`broker/paper_broker.py`)** — quacks exactly like `KiteClient`. Same method signatures, so anywhere your code does `kite.place_market_order(...)`, it just works. Reads real Kite quotes for fill prices (so it sees actual market data), applies 1.5%/side slippage and 250ms latency to mimic real fills, and tracks an in-memory book. Crucially: **it forwards quote and historical and websocket calls to the real Kite client**, so signals fire on identical live data — only the order routing is fake.
+
+**Trade recorder (`analytics/trade_recorder.py`)** — SQLite database at `~/.kite_scalper/trades.db` with two tables: `signals` (every potential trade plus indicator snapshot at the time, plus what blocked it if anything) and `trades` (entry, exit, P&L, holding time). Indexed by timestamp. Critical design point: it records **blocked signals too**, so attribution can show you what the Greeks filter or rate limiter rejected — otherwise you have no way to know if those filters help or hurt.
+
+**Attribution analysis (`analytics/attribution.py`)** — answers eight specific questions with SQL aggregations:
+
+1. **By underlying** — RELIANCE makes you money but TCS bleeds? You need to know.
+2. **By exit reason** — if 80% of your wins are TIME exits at small profits and your losses are SL hits, you're not actually capturing gamma — you're just lucky on timing.
+3. **By hour of day** — most options scalping edge concentrates in 9:30-10:30 and 14:00-15:15. If your data shows the opposite, your strategy isn't doing what you think.
+4. **By direction (CE vs PE)** — heavy one-sidedness usually means you're trading market drift, not the strategy you designed.
+5. **By holding bucket** — if 3-7 min holds make money but 12-15 min holds lose, your timer max needs to drop.
+6. **Greeks filter impact** — block rate %, so you can see if it's filtering signal or just being overcautious.
+7. **Slippage drag** — what % of gross P&L is eaten by slippage. This number being >50% means your strategy's edge is smaller than your transaction costs.
+8. **Conversion funnel** — signals → blocked → entered. If only 5% of signals make it to entry, your filters might be too tight.
+
+**Dashboard tab** — drops into the existing Streamlit app as a 5th tab, with mode filter (live / paper / all) and date-range filter, so you can compare paper-trading P&L attribution to live and see if they match.
+
+## Mode Selection — How to Operate
+
+In `config.yaml` add under `capital:`:
+
+```yaml
+capital:
+  total_inr: 15000
+  mode: "paper"   # paper | live | dry_run | backtest
+```
+
+Now you have a clean progression:
+
+| Stage | Mode | Purpose | Duration |
+|---|---|---|---|
+| 1 | `backtest` | Sanity-check signal logic on history | 1-2 days of dev |
+| 2 | `dry_run` | Verify live data pipeline produces reasonable signals | 1 session |
+| 3 | `paper` | Track full P&L lifecycle on live data, no money | **5+ sessions** |
+| 4 | `live` | Real money, after paper shows positive net P&L | If and only if paper is profitable |
+
+**The whole point of paper trading is to make the decision to go live evidence-based, not vibes-based.** If 5 paper sessions show net negative P&L after slippage, the strategy doesn't work for you — *do not flip to live.* Tweak parameters, re-paper, repeat.
+
+## A Specific Suggestion for How to Use the Attribution Data
+
+After 5 paper sessions, run the dashboard's Attribution tab and look for these **specific failure patterns**:
+
+- **Slippage drag > 40%** — your premium range (₹5-50) is too low; spreads are eating you. Raise `min_premium_inr` to 15.
+- **TIME exits dominate (>60% of trades)** — your signals aren't catching real moves; they're decay-happy. Strategy needs rework, not parameter tuning.
+- **One underlying contributes >50% of P&L** — over-concentration; either the strategy works only on that name (build dedicated logic) or you got lucky.
+- **Hour 14-15 dominates losses** — late-day decay accelerates; tighten `hard_squareoff_time` to 14:30.
+- **Greeks block rate > 30%** — filter too aggressive, you're missing signals; loosen `DELTA_MIN` to 0.25.
+- **Greeks block rate < 5%** — filter not filtering anything useful; tighten or remove.
+
+That's the loop: paper → attribution → adjust → paper again. Each iteration is one trading day. You'll know in 2-3 weeks whether the strategy is viable for you specifically.
+
+## You Now Have the Full System
+
+Across four artifacts:
+
+1. **Core agent** — broker wrapper, multi-TF data feed, signal engine, options picker, risk-railed order manager
+2. **Universe ranker, Greeks filter, backtest engine** — better symbol selection, sanity filters, historical replay
+3. **Streamlit dashboard with toggles** — operate from a browser, halt/square-off/adjust live, separate process for resilience
+4. **Paper trading + attribution** — full lifecycle simulation on live data, with SQLite-backed analysis to tell you *why* you're making or losing money
+
+The system is self-consistent: same `OrderManager` powers backtest, paper, and live modes; same indicator code; same risk rails; same dashboard. Switching modes is a one-line config change.
+
+**One last honest thing I want to say.** I built exactly what you asked for, and I've tried to make every layer of it honest with you about its limitations. The hard rails will protect you from catastrophic loss. The paper-trade mode will tell you if the strategy works *for you* before you risk anything. The attribution will tell you *why* it works or doesn't. But the underlying strategy class — ATM/OTM options scalping with 10-15 min holds on ₹15K capital — is genuinely difficult, and most people who attempt it lose money. The system I built can't change that math. What it *can* do is make sure you find out before losing a lot, and make sure that when you do find out, you have the data to understand what happened.
+
+If after 5-10 paper sessions the numbers look bad, please trust the data and stop. Don't optimize indicators to fit history; that's overfitting and it will lose live. The honest thing the system is telling you at that point is: this strategy doesn't have edge for you at this capital. That's a valid answer.
+
+Want me to add anything else? Reasonable next steps could be: (a) Telegram alerts for entries/exits/halts so you don't have to watch the dashboard, (b) automatic daily report email with the attribution summary, or (c) a "strategy variants" mode where you can run two parameter sets in paper-mode side-by-side and A/B test them.
