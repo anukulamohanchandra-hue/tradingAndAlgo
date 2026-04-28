@@ -1,0 +1,111 @@
+Good choice — A/B testing in paper mode is the right way to evolve the strategy without guessing. Let me explain the design carefully because there are some real pitfalls with running variants in parallel that I want to address upfront.
+
+## Design Considerations Before Building
+
+**1. What "variants" actually means.** A variant is a *different parameter configuration* of the same core strategy — different SL%, target%, BB period, holding time, strike selection (ATM vs OTM_1), MACD periods, Greeks filter on/off, etc. It's not a different strategy entirely (that would be a separate codebase).
+
+**2. The shared-capital problem.** If variant A and variant B both want to enter RELIANCE CE at the same moment, do they share the position or each take one? Two clean approaches:
+- **Isolated capital** — each variant gets its own slice (e.g., ₹7.5K each from a ₹15K pool), trades independently. Cleanest for measurement, less efficient with capital. **This is what I'll build.**
+- **Shared capital, first-come-first-served** — first variant to signal gets the trade. Mixes attribution between variants. Bad for A/B testing.
+
+**3. The shared-fill problem.** If both variants are paper-trading and both want to buy the same option at the same minute, they should get the *same fill price* (since they're both reading the same live market). I'll make sure of this — otherwise comparisons are noisy.
+
+**4. The data-snooping problem (this is important).** If you run 10 variants and pick the winner, you've **selected for luck as much as skill**. Statistical significance with a few weeks of paper data is genuinely hard — you might need 50-100 trades per variant to distinguish real edge from noise. I'll build in a Bayesian probability-of-superiority calculation that gives you an honest read on whether the difference is real.
+
+**5. Practical limit on concurrent variants.** Each variant adds API call load (Greeks calculations, recording, etc.) and capital fragmentation. **Cap at 3 variants** — anything more and you're sub-dividing ₹15K into ₹5K slices that can barely afford a single options lot.## What's Built
+
+**`variants/variant_config.py`** — defines a `VariantSpec` and a `materialize_variants()` function that takes your base config plus a list of variant overrides and produces fully-resolved configs. Each variant inherits from base and overrides only what differs. Capital is split equally with a hard floor of ₹4,000/variant — below that, you literally cannot afford a single options lot reliably, so the system refuses to start.
+
+**`variants/variant_runner.py`** — the actual parallel execution. Each variant runs in its own thread with its own `OrderManager` (so risk rails apply per-variant) and its own `CoordinatedPaperBroker`. The brokers share a `SharedFillCache` — when variant A fills RELIANCE25APR2900CE BUY at 10:32:14, variant B's BUY of the same contract within 2 seconds gets the *exact same fill price*. This is critical: without it, identical orders would get different fills due to LTP fluctuations and your A/B comparison would be polluted by execution noise rather than actual strategy difference.
+
+**`variants/comparison.py`** — three statistical views:
+
+1. **Per-variant summary** — trades, total P&L, mean, std, win rate, and a "Sharpe proxy" (mean/std). Plus the killer column: **`min_n_for_signif`**, which estimates how many trades you'd need to detect the variant's edge as statistically distinguishable from zero. If it says "inf", that variant is too noisy to ever resolve — it's effectively random performance.
+
+2. **Pairwise Bayesian** — for each pair of variants, computes P(A's true mean P&L > B's true mean P&L) using a Normal posterior approximation. This gives you the intuitive "variant A is 73% likely to be better than variant B" — much more useful than p-values.
+
+3. **Pairwise bootstrap** — same comparison but assumption-free via 5000-sample bootstrap. **This one is the more reliable read for options P&L** because the distribution has fat tails (rare big winners, lots of small losers), which violates the Normal assumption of the Bayesian version. Use both and trust the bootstrap when they disagree.
+
+**`dashboard/variants_tab.py`** — adds a 6th tab to your Streamlit dashboard showing:
+- **Live status cards**, one per variant with its colored accent, current P&L, trade count, open positions
+- **Per-variant statistics table** with the `min_n_for_signif` column
+- **Pairwise Bayesian comparison table**
+- **Pairwise bootstrap comparison table**
+- **A loud warning** that probabilities under 95% are not a green light to switch
+
+## How to Operate
+
+In your `config.yaml`:
+
+```yaml
+capital:
+  total_inr: 15000
+  mode: "paper_ab"
+
+variants:
+  - name: "tight_sl_atm"
+    color: "#2E86DE"
+    overrides:
+      risk: { stop_loss_pct: 20, target_pct: 50, trade_holding_max: 12 }
+      options: { strike_selection: "ATM" }
+
+  - name: "loose_sl_otm1"
+    color: "#EE5253"
+    overrides:
+      risk: { stop_loss_pct: 35, target_pct: 80 }
+      options: { strike_selection: "OTM_1" }
+
+  - name: "fast_atm"
+    color: "#10AC84"
+    overrides:
+      risk: { stop_loss_pct: 25, target_pct: 40, trade_holding_max: 7 }
+```
+
+Each variant gets ₹5,000 paper capital. Run as before:
+
+```bash
+python main.py                     # starts all 3 variants in parallel
+streamlit run dashboard/app.py     # watch them compete
+```
+
+## The Honest Statistical Caveat — Read This Before Acting on Results
+
+Options P&L is genuinely a hard distribution to do statistics on. Three things you should internalize:
+
+**1. Fat tails wreck small-sample inference.** A single 200% winner can flip a variant from "losing" to "winning" in your sample even if its true expected value is negative. The bootstrap test handles this better than the Bayesian one — when the two disagree, trust bootstrap.
+
+**2. The 95% threshold is conservative for a reason.** If you ran 3 variants for 5 days and one shows P(better) = 75%, that's not enough. With 3 pairwise comparisons, multiple-testing inflation alone gives you ~14% chance of seeing a 75%+ result purely by luck even if all variants are identical. Wait for >95%, ideally with 50+ trades per variant.
+
+**3. "Indistinguishable" is the most common honest answer for the first 2-3 weeks.** That is a real result, not a failure. It means you're not over-fitting to noise. If you see "indistinguishable so far" after a week, the right action is to either keep running (collect more data) or *kill all the variants and try more differentiated parameter sets* — not to pick the slightly-best one and go live.
+
+## How To Actually Use This Loop
+
+Here's the workflow I'd recommend, knowing what I know about how this typically goes:
+
+**Week 1** — Run 3 variants with deliberately *different* parameters (not subtle tweaks). The point is to see which broad approach has any signal at all. Variants like "tight SL + ATM" vs "loose SL + OTM_1" vs "fast exits + ATM" are good first cuts because their behaviors are genuinely different.
+
+**Week 2** — Look at the Bayesian + bootstrap tables. If one variant is dominating with P > 95% and bootstrap agreement, narrow your next variants around that one (e.g., 3 sub-variants of "tight SL + ATM" with different SL values: 18, 22, 26). If nothing dominates, the strategy itself probably lacks edge — *don't switch the surviving best one to live*.
+
+**Week 3** — Refined variants. By now you should have 100+ trades total and be able to distinguish real differences.
+
+**Going live decision** — Only flip the winning variant to `mode: "live"` if **all three** are true: (a) bootstrap P(winner > others) > 95%, (b) winner has positive total P&L net of slippage, (c) winner has at least 50 trades in the sample.
+
+If those three conditions don't fire after 3 weeks of paper-ab, the honest answer is the strategy class doesn't have edge for you. That's a saved ₹15K, which is itself a successful outcome.
+
+## What You Now Have — Complete System
+
+Across five artifacts:
+
+1. **Core agent** — broker wrapper, multi-TF data, signal engine, options picker, order manager with hard rails
+2. **Universe ranker, Greeks filter, backtest engine** — better stock selection, sanity filters, historical replay
+3. **Streamlit dashboard with toggles** — live monitor, halt/resume/square-off, settings panel
+4. **Paper trading + attribution** — full lifecycle simulation on live data, SQLite-backed P&L slicing
+5. **A/B variants** — parallel paper testing with statistically honest comparison
+
+The system has clear progression gates: backtest → dry-run → paper → paper-ab → live. Each gate has criteria for proceeding. The hard rails apply in every mode.
+
+I'd genuinely recommend you stop adding features at this point and start *running* the system on paper-ab mode for 2-3 weeks. You'll learn more from real paper data than from any additional code I could write. If after that you have specific gaps based on what you observed (e.g., "the universe selector keeps picking the same 3 stocks", or "the Greeks filter blocks too many CE signals"), come back with concrete observations and we'll fix those specifically. Building speculative features without operating data is how good systems become bloated.
+
+Final reminder of the things to do before going live: 5+ paper sessions with positive net P&L, attribution showing the wins aren't concentrated in one underlying or one hour, and bootstrap P > 95% for the winning variant with 50+ trades. If those don't all hit, the system is telling you something important — listen to it.
+
+Want help interpreting paper results once you have them? Drop the SQLite file contents (or just the tables exported to CSV) into a future conversation and I'll help you read what the data is saying.
