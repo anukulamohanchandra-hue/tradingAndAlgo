@@ -1,0 +1,92 @@
+Good call — a dashboard with toggles makes operating this much safer because you can flip dry-run, halt trading, or adjust limits without restarting the process. But I want to flag the architecture decision before I build:
+
+## Important Design Choice: Read-Mostly vs Read-Write Toggles
+
+A dashboard that *reads* state (positions, P&L, logs) is straightforward. A dashboard that *writes* config (toggles, limits) into a running trading process is genuinely tricky. Two real concerns:
+
+**1. Race conditions.** Your trading loop runs every 5 seconds making decisions; if you flip "dry-run off" mid-decision, the next signal could fire live with stale internal state. Solution: use a thread-safe shared state object that the trading loop reads atomically once per cycle.
+
+**2. The hard limits must stay hard.** If the dashboard could relax `MAX_DAILY_LOSS_PCT` or disable the 3:15 PM square-off, the rails I built in artifact 1 are useless. So the dashboard exposes **operational toggles** (halt, resume, adjust *within* limits, force square-off) but cannot lift the frozen ceilings in `risk_limits.py`.
+
+Here's what'll be toggleable vs frozen:
+
+| Toggleable from dashboard | Frozen (source-edit only) |
+|---|---|
+| Halt / Resume trading | `MAX_DAILY_LOSS_PCT = 30%` ceiling |
+| Dry-run on/off | `MAX_PER_TRADE_RISK_PCT = 5%` ceiling |
+| Force square-off all | `MAX_TRADES_PER_DAY = 5` ceiling |
+| Tighten daily loss limit (e.g. 30→20%) | `SQUAREOFF_TIME = 15:15 IST` |
+| Tighten per-trade risk (5→3%) | Min dry-run signals on first run |
+| Reduce max trades/day (5→3) | Order rate caps |
+| Adjust SL/TP percentages | |
+| Pause specific underlyings | |
+
+You can only make things *more* conservative from the UI, never less. Going looser still requires editing source — that's deliberate friction.
+
+**3. Architecture: how the dashboard talks to the trader.** Two options:
+- **Same process** — Streamlit runs the trader in a background thread. Simple, but if Streamlit crashes, your trader dies.
+- **Separate processes** — Trader writes state to a small SQLite/JSON file, dashboard reads + writes commands. Robust, but slightly more code.
+
+I'm going with **separate processes via a shared state file** — if you accidentally close the browser or Streamlit hangs, your trading process keeps running with whatever the last settings were. This is the right call for live trading.## What You Get
+
+**Dashboard layout:**
+- **Top status bar** — trader alive/offline, dry-run vs live, halt status, day P&L, trades used
+- **Sidebar (always visible)** — emergency HALT / RESUME / SQUARE OFF ALL buttons, plus settings sliders for SL%, TP%, max loss, etc., with an explicit "Apply Settings" button so accidental slider drags don't change live config
+- **Tab 1 — Positions** — live open positions with age in minutes, plus today's closed trades
+- **Tab 2 — Universe** — clickable tiles for each underlying, click to pause/resume that symbol without halting everything
+- **Tab 3 — Event Log** — filterable by severity, last 200 events
+- **Tab 4 — P&L chart** — cumulative day P&L line chart
+
+**Auto-refresh every 3 seconds** via meta refresh tag — no manual reload needed.
+
+## How the Toggle Safety Works
+
+1. Dashboard writes to `~/.kite_scalper/settings.json` and `commands.json`
+2. Trader's main loop drains commands at the **top** of each cycle (so a HALT lands before the next signal evaluation, not mid-trade)
+3. `SettingsStore.write()` enforces hard limits *every time* — even if you manually edit `settings.json` and put `max_daily_loss_pct: 99`, the next read clamps it to 30%
+4. The hard limits in `risk_limits.py` are **read from source**, not from settings, so corrupting the JSON files cannot disable them
+
+The emergency buttons take effect within ~5 seconds (next loop iteration). Square-off is immediate — it doesn't wait for the loop, it's just enqueued and the trader processes it before evaluating new signals.
+
+## Setup
+
+```bash
+pip install streamlit plotly filelock
+```
+
+Apply the patches in `PATCHES_FOR_MAIN` to `main.py` (the integration is mechanical — three additions: imports + initialization, command-drain block at top of loop, state-write at bottom of loop).
+
+Then:
+```bash
+# Terminal 1 — the trader
+python main.py
+
+# Terminal 2 — the dashboard
+streamlit run dashboard/app.py
+```
+
+Browser opens to `http://localhost:8501` automatically.
+
+## A Few Operating Tips
+
+**Keep the dashboard open on your phone too** — Streamlit's network mode (`streamlit run dashboard/app.py --server.address=0.0.0.0`) lets you reach it from your phone on the same WiFi at `http://your-laptop-ip:8501`. Useful for the panic-square-off button when you're not at the desk.
+
+**The "trader offline" indicator turns red if no state update for >30s** — that's your sign the trader process crashed or hung. If that happens during market hours, your positions are still open at the broker; manually square them off in Kite immediately.
+
+**On day 1, leave dry-run ON for the entire session.** Watch the event log fill up with would-have-been trades. If by 3 PM you've seen 3-5 dry-run signals and they look reasonable, **then** flip dry-run off the next morning. Don't flip it off mid-session — it creates inconsistent behavior in the day's stats.
+
+**The "Apply Settings" button is intentional friction.** Sliders alone don't take effect — you have to commit. This prevents accidentally dragging a slider while monitoring and changing live behavior.
+
+## What's Now in the Full System
+
+You now have a complete project across three artifacts:
+
+- **Artifact 1** — core agent (broker wrapper, data feed, signal engine, options picker, order manager, main loop, hard risk rails)
+- **Artifact 2** — live universe ranker, Greeks filter, backtest engine
+- **Artifact 3** — Streamlit dashboard with safe toggles, separate process, file-locked state
+
+All wired through the same `OrderManager` so backtest, live, and dashboard see consistent behavior.
+
+Final unsolicited advice and then I'll stop: before you run any of this with real capital, please do a 5-day dry-run cycle. Watch the dashboard. Sanity-check that signals fire when you'd expect them to. The hard rails will protect you from catastrophic loss, but they won't protect you from steady bleeding due to a logic bug or slippage assumption being wrong. Five days of dry-run is cheap insurance.
+
+Want me to add anything else? Some natural next steps would be: (a) Telegram/Slack alerts on entry/exit/halt, (b) per-trade P&L attribution analysis (which signals are actually profitable), or (c) a simple paper-trading mode that's distinct from dry-run — meaning it simulates fills and tracks P&L without touching the broker at all.
